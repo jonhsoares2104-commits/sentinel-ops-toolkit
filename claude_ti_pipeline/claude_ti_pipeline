@@ -1,0 +1,523 @@
+import os
+import sys
+import json
+import time
+import argparse
+import subprocess
+import smtplib
+from email.message import EmailMessage
+from datetime import datetime
+
+import requests
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import cm
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+)
+
+API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+API_URL = "https://api.anthropic.com/v1/messages"
+MODEL = "claude-sonnet-4-6"
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 2
+
+HISTORY_FILE = os.path.join(os.path.dirname(__file__), "ultimo_snapshot.json")
+OUTPUT_PDF = os.path.join(os.path.dirname(__file__), "relatorio_ti.pdf")
+
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.office365.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
+EMAIL_REMETENTE = os.environ.get("EMAIL_REMETENTE", SMTP_USER)
+EMAIL_DESTINATARIOS = [
+    e.strip() for e in os.environ.get("EMAIL_DESTINATARIOS", "").split(",") if e.strip()
+]
+
+LIMITE_DISCO_CRITICO_PCT = float(os.environ.get("LIMITE_DISCO_CRITICO_PCT", "15"))
+LIMITE_DISCO_ATENCAO_PCT = float(os.environ.get("LIMITE_DISCO_ATENCAO_PCT", "25"))
+
+PALAVRAS_CHAVE_TASK_CRITICA = [
+    p.strip().lower() for p in
+    os.environ.get("PALAVRAS_CHAVE_TASK_CRITICA", "financeiro,backup,sql,folha,pagamento,nfe").split(",")
+    if p.strip()
+]
+
+SERVICOS_CRITICOS = [
+    s.strip().lower() for s in
+    os.environ.get("SERVICOS_CRITICOS", "mssqlserver,sqlserveragent,w3svc").split(",")
+    if s.strip()
+]
+
+def rodar_powershell(comando: str) -> str:
+    resultado = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", comando],
+        capture_output=True, text=True, timeout=60
+    )
+    if resultado.returncode != 0:
+        raise RuntimeError(f"PowerShell falhou: {resultado.stderr.strip()}")
+    return resultado.stdout.strip()
+
+
+def coletar_dados_sistema() -> dict:
+    """
+    Coleta scheduled tasks, uso de disco e serviços parados.
+    Cada bloco pede saída em JSON direto do PowerShell (ConvertTo-Json),
+    já facilita a vida na hora de estruturar os dados em Python.
+    """
+    tasks_json = rodar_powershell(
+        "Get-ScheduledTask | Get-ScheduledTaskInfo | "
+        "Select-Object TaskName, LastRunTime, LastTaskResult, NextRunTime "
+        "| ConvertTo-Json"
+    )
+    disco_json = rodar_powershell(
+        "Get-PSDrive -PSProvider FileSystem | "
+        "Select-Object Name, @{N='UsedGB';E={[math]::Round($_.Used/1GB,1)}}, "
+        "@{N='FreeGB';E={[math]::Round($_.Free/1GB,1)}} | ConvertTo-Json"
+    )
+    servicos_json = rodar_powershell(
+        "Get-Service | Where-Object {$_.StartType -eq 'Automatic' -and $_.Status -ne 'Running'} "
+        "| Select-Object Name, Status | ConvertTo-Json"
+    )
+
+    return {
+        "coletado_em": datetime.now().isoformat(timespec="seconds"),
+        "scheduled_tasks": json.loads(tasks_json) if tasks_json else [],
+        "discos": json.loads(disco_json) if disco_json else [],
+        "servicos_parados": json.loads(servicos_json) if servicos_json else [],
+    }
+
+
+def dados_demo() -> dict:
+    """Dataset simulado, usado com --demo para testar/apresentar sem depender do Windows."""
+    return {
+        "coletado_em": datetime.now().isoformat(timespec="seconds"),
+        "scheduled_tasks": [
+            {"TaskName": "Backup_Diario_SQL", "LastRunTime": "2026-07-04T02:00:00", "LastTaskResult": 0, "NextRunTime": "2026-07-05T02:00:00"},
+            {"TaskName": "Limpeza_TempFiles", "LastRunTime": "2026-07-04T03:00:00", "LastTaskResult": 267011, "NextRunTime": "2026-07-05T03:00:00"},
+            {"TaskName": "Sync_Relatorios_Financeiro", "LastRunTime": "2026-07-03T23:00:00", "LastTaskResult": 1, "NextRunTime": "2026-07-04T23:00:00"},
+            {"TaskName": "Atualizacao_Antivirus", "LastRunTime": "2026-07-04T06:00:00", "LastTaskResult": 0, "NextRunTime": "2026-07-05T06:00:00"},
+        ],
+        "discos": [
+            {"Name": "C", "UsedGB": 210.4, "FreeGB": 14.2},
+            {"Name": "D", "UsedGB": 340.0, "FreeGB": 660.0},
+        ],
+        "servicos_parados": [
+            {"Name": "wuauserv", "Status": "Stopped"},
+            {"Name": "Spooler", "Status": "Stopped"},
+        ],
+    }
+
+
+# ----------------------------------------------------------------------------
+# 2. HISTÓRICO (comparação entre execuções)
+# ----------------------------------------------------------------------------
+def carregar_snapshot_anterior() -> dict | None:
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+
+def salvar_snapshot(dados: dict) -> None:
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(dados, f, ensure_ascii=False, indent=2)
+
+
+# ----------------------------------------------------------------------------
+# 3. ANÁLISE VIA CLAUDE API
+# ----------------------------------------------------------------------------
+def montar_prompt(dados_atuais: dict, dados_anteriores: dict | None) -> str:
+    """
+    Instrui o modelo a devolver SOMENTE JSON, com um schema fixo.
+    Isso facilita parsear a resposta sem se preocupar com texto solto.
+    """
+    comparacao_txt = (
+        json.dumps(dados_anteriores, ensure_ascii=False)
+        if dados_anteriores else "Nenhum snapshot anterior disponível (primeira execução)."
+    )
+
+    return f"""Você é um analista de infraestrutura de TI Windows. Analise os dados abaixo
+e responda APENAS com um objeto JSON válido, sem markdown, sem texto antes ou depois,
+seguindo exatamente este schema:
+
+{{
+  "resumo_executivo": "string curta, 3-4 frases, linguagem simples para gestão não-técnica",
+  "nivel_geral": "OK" | "ATENCAO" | "CRITICO",
+  "itens": [
+    {{
+      "categoria": "task" | "disco" | "servico",
+      "nome": "string",
+      "severidade": "OK" | "ATENCAO" | "CRITICO",
+      "detalhe": "string curta explicando o problema (ou 'Normal' se estiver ok)",
+      "recomendacao": "string curta com a próxima ação sugerida (ou 'Nenhuma ação necessária')"
+    }}
+  ],
+  "mudancas_desde_ultima_execucao": [
+    "string descrevendo cada mudança relevante (novo problema, problema resolvido, piora/melhora)"
+  ]
+}}
+
+Regras de severidade (use exatamente estes critérios, não invente outros):
+- Para cada disco, calcule o percentual livre como FreeGB / (UsedGB + FreeGB) * 100
+- Disco com menos de {LIMITE_DISCO_CRITICO_PCT:.0f}% livre -> CRITICO
+- Disco com menos de {LIMITE_DISCO_ATENCAO_PCT:.0f}% livre (mas acima do limite crítico) -> ATENCAO
+- Task com LastTaskResult diferente de 0 -> ATENCAO; vira CRITICO se o nome da task contiver
+  alguma destas palavras-chave (case-insensitive): {', '.join(PALAVRAS_CHAVE_TASK_CRITICA)}
+- Serviço automático parado -> ATENCAO; vira CRITICO se o nome do serviço for um destes
+  (case-insensitive): {', '.join(SERVICOS_CRITICOS)}
+
+DADOS ATUAIS:
+{json.dumps(dados_atuais, ensure_ascii=False)}
+
+SNAPSHOT ANTERIOR (para comparação):
+{comparacao_txt}
+"""
+
+
+def chamar_claude_api(prompt: str) -> dict:
+    """
+    Chama a API com retry + backoff exponencial simples.
+    Valida se a resposta é um JSON parseável antes de devolver.
+    """
+    headers = {
+        "x-api-key": API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    payload = {
+        "model": MODEL,
+        "max_tokens": 2000,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    ultimo_erro = None
+    for tentativa in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+            resp.raise_for_status()
+            texto = resp.json()["content"][0]["text"]
+            texto_limpo = texto.replace("```json", "").replace("```", "").strip()
+            return json.loads(texto_limpo)
+        except (requests.RequestException, KeyError, json.JSONDecodeError) as erro:
+            ultimo_erro = erro
+            print(f"[tentativa {tentativa}/{MAX_RETRIES}] falhou: {erro}")
+            if tentativa < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_SECONDS * tentativa)
+
+    raise RuntimeError(f"Não foi possível obter análise da API após {MAX_RETRIES} tentativas: {ultimo_erro}")
+
+
+def analise_demo(dados_atuais: dict) -> dict:
+    """Análise simulada (mesmo schema da API real), usada em --demo."""
+    return {
+        "resumo_executivo": (
+            "O ambiente está majoritariamente estável. Um ponto crítico: o disco C: está "
+            "com apenas 14.2 GB livres, o que exige limpeza ou expansão em breve. A tarefa "
+            "de sincronização financeira falhou na última execução e precisa ser verificada. "
+            "Dois serviços automáticos estão parados, sem impacto imediato."
+        ),
+        "nivel_geral": "CRITICO",
+        "itens": [
+            {"categoria": "task", "nome": "Backup_Diario_SQL", "severidade": "OK", "detalhe": "Executou com sucesso.", "recomendacao": "Nenhuma ação necessária"},
+            {"categoria": "task", "nome": "Limpeza_TempFiles", "severidade": "ATENCAO", "detalhe": "Terminou com código de erro 267011 (tarefa ainda em execução ou travada).", "recomendacao": "Verificar se o processo anterior travou e reiniciar a task manualmente."},
+            {"categoria": "task", "nome": "Sync_Relatorios_Financeiro", "severidade": "CRITICO", "detalhe": "Falhou com código 1 (erro genérico). Tarefa é sensível para o financeiro.", "recomendacao": "Checar log de execução e credenciais da conta de serviço usada."},
+            {"categoria": "task", "nome": "Atualizacao_Antivirus", "severidade": "OK", "detalhe": "Executou com sucesso.", "recomendacao": "Nenhuma ação necessária"},
+            {"categoria": "disco", "nome": "C:", "severidade": "CRITICO", "detalhe": "Apenas 14.2 GB livres de 224.6 GB (6% livre).", "recomendacao": "Executar limpeza de disco ou expandir volume com urgência."},
+            {"categoria": "disco", "nome": "D:", "severidade": "OK", "detalhe": "660 GB livres, uso saudável.", "recomendacao": "Nenhuma ação necessária"},
+            {"categoria": "servico", "nome": "wuauserv", "severidade": "ATENCAO", "detalhe": "Serviço de Windows Update automático está parado.", "recomendacao": "Iniciar o serviço para garantir atualizações de segurança."},
+            {"categoria": "servico", "nome": "Spooler", "severidade": "ATENCAO", "detalhe": "Spooler de impressão parado.", "recomendacao": "Iniciar se houver impressoras dependentes neste servidor."},
+        ],
+        "mudancas_desde_ultima_execucao": [
+            "NOVO: task Sync_Relatorios_Financeiro passou a falhar (estava OK na execução anterior).",
+            "PIOROU: disco C: caiu de 22% livre para 6% livre.",
+            "RESOLVIDO: task Atualizacao_Antivirus, que falhava antes, voltou a funcionar.",
+        ],
+    }
+
+
+# ----------------------------------------------------------------------------
+# 4. GERAÇÃO DO PDF
+# ----------------------------------------------------------------------------
+COR_OK = colors.HexColor("#2e7d32")
+COR_ATENCAO = colors.HexColor("#e65100")
+COR_CRITICO = colors.HexColor("#c62828")
+COR_HEADER = colors.HexColor("#1a237e")
+
+
+def cor_severidade(sev: str):
+    return {"OK": COR_OK, "ATENCAO": COR_ATENCAO, "CRITICO": COR_CRITICO}.get(sev, colors.black)
+
+
+def gerar_pdf(dados_atuais: dict, analise: dict, caminho_saida: str) -> None:
+    doc = SimpleDocTemplate(caminho_saida, pagesize=A4,
+                             topMargin=2 * cm, bottomMargin=2 * cm)
+    styles = getSampleStyleSheet()
+
+    estilo_titulo = ParagraphStyle("TituloCustom", parent=styles["Title"], textColor=COR_HEADER)
+    estilo_secao = ParagraphStyle("SecaoCustom", parent=styles["Heading2"], textColor=COR_HEADER, spaceBefore=14)
+    estilo_normal = styles["Normal"]
+    estilo_celula = ParagraphStyle("Celula", parent=styles["Normal"], fontSize=9, leading=11)
+
+    story = []
+
+    # --- Capa / cabeçalho ---
+    story.append(Paragraph("Relatório de Saúde do Ambiente de TI", estilo_titulo))
+    story.append(Paragraph(f"Gerado em {dados_atuais['coletado_em'].replace('T', ' ')}", estilo_normal))
+    story.append(Spacer(1, 6))
+
+    nivel = analise["nivel_geral"]
+    story.append(Paragraph(
+        f'Status geral: <font color="{cor_severidade(nivel).hexval()}"><b>{nivel}</b></font>',
+        estilo_normal
+    ))
+    story.append(Spacer(1, 14))
+
+    # --- Resumo executivo (gerado pelo Claude) ---
+    story.append(Paragraph("Resumo Executivo", estilo_secao))
+    story.append(Paragraph(analise["resumo_executivo"], estilo_normal))
+
+    # --- Mudanças desde a última execução ---
+    if analise.get("mudancas_desde_ultima_execucao"):
+        story.append(Paragraph("Mudanças desde a última execução", estilo_secao))
+        for mudanca in analise["mudancas_desde_ultima_execucao"]:
+            story.append(Paragraph(f"• {mudanca}", estilo_normal))
+
+    # --- Painel de severidade (tabela resumida) ---
+    story.append(Paragraph("Painel de Itens Verificados", estilo_secao))
+    cabecalho = ["Categoria", "Item", "Severidade", "Detalhe", "Recomendação"]
+    linhas = [cabecalho]
+    for item in analise["itens"]:
+        linhas.append([
+            item["categoria"].capitalize(),
+            Paragraph(item["nome"], estilo_celula),
+            Paragraph(f'<font color="{cor_severidade(item["severidade"]).hexval()}"><b>{item["severidade"]}</b></font>', estilo_celula),
+            Paragraph(item["detalhe"], estilo_celula),
+            Paragraph(item["recomendacao"], estilo_celula),
+        ])
+
+    tabela = Table(linhas, colWidths=[2.1 * cm, 3.3 * cm, 2.2 * cm, 5.2 * cm, 5.2 * cm], repeatRows=1)
+    tabela.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), COR_HEADER),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, 0), 9),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f5f5f5")]),
+    ]))
+    story.append(tabela)
+
+    # --- Inventário bruto completo (segunda página) ---
+    story.append(PageBreak())
+    story.append(Paragraph("Anexo — Inventário Bruto Coletado", estilo_secao))
+
+    story.append(Paragraph("Scheduled Tasks", styles["Heading3"]))
+    linhas_tasks = [["Nome", "Última execução", "Código retorno", "Próxima execução"]]
+    for t in dados_atuais["scheduled_tasks"]:
+        linhas_tasks.append([
+            Paragraph(t.get("TaskName", ""), estilo_celula),
+            str(t.get("LastRunTime", "")),
+            str(t.get("LastTaskResult", "")),
+            str(t.get("NextRunTime", "")),
+        ])
+    tabela_tasks = Table(linhas_tasks, colWidths=[6 * cm, 4 * cm, 3 * cm, 4 * cm], repeatRows=1)
+    tabela_tasks.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#37474f")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+    ]))
+    story.append(tabela_tasks)
+    story.append(Spacer(1, 12))
+
+    story.append(Paragraph("Discos", styles["Heading3"]))
+    linhas_disco = [["Volume", "Usado (GB)", "Livre (GB)"]]
+    for d in dados_atuais["discos"]:
+        linhas_disco.append([d.get("Name", ""), str(d.get("UsedGB", "")), str(d.get("FreeGB", ""))])
+    tabela_disco = Table(linhas_disco, colWidths=[4 * cm, 4 * cm, 4 * cm])
+    tabela_disco.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#37474f")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+    ]))
+    story.append(tabela_disco)
+    story.append(Spacer(1, 12))
+
+    story.append(Paragraph("Serviços automáticos parados", styles["Heading3"]))
+    if dados_atuais["servicos_parados"]:
+        linhas_srv = [["Nome", "Status"]]
+        for s in dados_atuais["servicos_parados"]:
+            linhas_srv.append([s.get("Name", ""), s.get("Status", "")])
+        tabela_srv = Table(linhas_srv, colWidths=[6 * cm, 6 * cm])
+        tabela_srv.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#37474f")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ]))
+        story.append(tabela_srv)
+    else:
+        story.append(Paragraph("Nenhum serviço automático parado.", estilo_normal))
+
+    doc.build(story)
+
+
+# ----------------------------------------------------------------------------
+# 5. ENVIO POR EMAIL
+# ----------------------------------------------------------------------------
+def enviar_email(caminho_pdf: str, analise: dict) -> None:
+    """
+    Envia o PDF por email via SMTP (funciona com Office365, Gmail, servidor
+    SMTP interno da empresa, etc — só trocar SMTP_HOST/PORT).
+    Assunto muda conforme a severidade, pra facilitar priorização na caixa de entrada.
+    """
+    if not SMTP_USER or not SMTP_PASSWORD:
+        print("AVISO: SMTP_USER/SMTP_PASSWORD não configurados — email não enviado.")
+        return
+    if not EMAIL_DESTINATARIOS:
+        print("AVISO: EMAIL_DESTINATARIOS não configurado — email não enviado.")
+        return
+
+    nivel = analise.get("nivel_geral", "OK")
+    prefixo = {"CRITICO": "[CRÍTICO] ", "ATENCAO": "[ATENÇÃO] ", "OK": ""}.get(nivel, "")
+    data_str = datetime.now().strftime("%d/%m/%Y")
+
+    msg = EmailMessage()
+    msg["Subject"] = f"{prefixo}Relatório de Saúde de TI — {data_str}"
+    msg["From"] = EMAIL_REMETENTE
+    msg["To"] = ", ".join(EMAIL_DESTINATARIOS)
+    msg.set_content(
+        f"Olá,\n\nSegue em anexo o relatório automático de saúde do ambiente de TI.\n\n"
+        f"Status geral: {nivel}\n\n"
+        f"Resumo executivo:\n{analise.get('resumo_executivo', '')}\n\n"
+        f"Relatório completo em anexo (PDF).\n\nEste é um email automático."
+    )
+
+    with open(caminho_pdf, "rb") as f:
+        msg.add_attachment(
+            f.read(), maintype="application", subtype="pdf",
+            filename=os.path.basename(caminho_pdf)
+        )
+
+    ultimo_erro = None
+    for tentativa in range(1, MAX_RETRIES + 1):
+        try:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as servidor:
+                servidor.starttls()
+                servidor.login(SMTP_USER, SMTP_PASSWORD)
+                servidor.send_message(msg)
+            print(f"Email enviado para: {', '.join(EMAIL_DESTINATARIOS)}")
+            return
+        except smtplib.SMTPException as erro:
+            ultimo_erro = erro
+            print(f"[tentativa {tentativa}/{MAX_RETRIES}] falha ao enviar email: {erro}")
+            if tentativa < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_SECONDS * tentativa)
+
+    print(f"AVISO: não foi possível enviar o email após {MAX_RETRIES} tentativas: {ultimo_erro}")
+
+
+# ----------------------------------------------------------------------------
+# 6. AUTO-INSTALAÇÃO COMO SCHEDULED TASK
+# ----------------------------------------------------------------------------
+NOME_TASK_AGENDADA = "ClaudeTI_RelatorioDiario"
+
+
+def instalar_agendamento(horario: str, com_email: bool) -> None:
+    """
+    Registra este próprio script como uma Scheduled Task do Windows, rodando
+    todo dia no horário informado. Usa 'schtasks /Create' — o mesmo comando
+    que você já usa manualmente, só que automatizado aqui.
+    """
+    python_exe = sys.executable  # garante o mesmo interpretador/venv que está rodando agora
+    script_path = os.path.abspath(__file__)
+    flags = "--email" if com_email else ""
+    comando = f'"{python_exe}" "{script_path}" {flags}'.strip()
+
+    cmd = [
+        "schtasks", "/Create",
+        "/SC", "DAILY",
+        "/TN", NOME_TASK_AGENDADA,
+        "/TR", comando,
+        "/ST", horario,
+        "/F",  # sobrescreve se já existir uma task com esse nome
+    ]
+
+    print(f"Registrando task '{NOME_TASK_AGENDADA}' para rodar todo dia às {horario}...")
+    resultado = subprocess.run(cmd, capture_output=True, text=True)
+    if resultado.returncode != 0:
+        raise RuntimeError(f"Falha ao criar a scheduled task: {resultado.stderr.strip()}")
+    print("Task agendada com sucesso! Verifique no Agendador de Tarefas do Windows.")
+    print(f"Comando registrado: {comando}")
+    print("\nATENÇÃO: como o Agendador de Tarefas não herda variáveis de ambiente da sua sessão,")
+    print("configure ANTHROPIC_API_KEY, SMTP_USER, SMTP_PASSWORD e EMAIL_DESTINATARIOS como")
+    print("variáveis de ambiente do SISTEMA (não só da sessão do usuário), via:")
+    print('  setx ANTHROPIC_API_KEY "sua_chave" /M')
+    print("(repita para as demais, sempre com /M para o escopo de máquina)")
+
+
+def desinstalar_agendamento() -> None:
+    """Remove a scheduled task criada por este script."""
+    cmd = ["schtasks", "/Delete", "/TN", NOME_TASK_AGENDADA, "/F"]
+    resultado = subprocess.run(cmd, capture_output=True, text=True)
+    if resultado.returncode != 0:
+        raise RuntimeError(f"Falha ao remover a scheduled task: {resultado.stderr.strip()}")
+    print(f"Task '{NOME_TASK_AGENDADA}' removida.")
+
+
+# ----------------------------------------------------------------------------
+# ORQUESTRAÇÃO
+# ----------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Pipeline de relatório de TI com análise via Claude API.")
+    parser.add_argument("--demo", action="store_true", help="Roda com dados simulados, sem PowerShell nem API key.")
+    parser.add_argument("--email", action="store_true", help="Envia o PDF por email após gerá-lo (requer variáveis SMTP_* e EMAIL_DESTINATARIOS).")
+    parser.add_argument("--instalar-agendamento", action="store_true", help="Registra este script como Scheduled Task diária do Windows e encerra.")
+    parser.add_argument("--desinstalar-agendamento", action="store_true", help="Remove a Scheduled Task criada anteriormente e encerra.")
+    parser.add_argument("--horario", default="07:00", help="Horário diário da task (formato HH:MM, padrão 07:00). Usado com --instalar-agendamento.")
+    args = parser.parse_args()
+
+    if args.desinstalar_agendamento:
+        desinstalar_agendamento()
+        return
+
+    if args.instalar_agendamento:
+        instalar_agendamento(args.horario, com_email=args.email)
+        return
+
+    if args.demo:
+        print("Rodando em modo demo (dados simulados)...")
+        dados_atuais = dados_demo()
+    else:
+        if not API_KEY:
+            sys.exit("ERRO: defina a variável de ambiente ANTHROPIC_API_KEY antes de rodar sem --demo.")
+        print("Coletando dados via PowerShell...")
+        dados_atuais = coletar_dados_sistema()
+
+    dados_anteriores = carregar_snapshot_anterior()
+
+    if args.demo:
+        print("Gerando análise simulada...")
+        analise = analise_demo(dados_atuais)
+    else:
+        print("Enviando dados para análise da Claude API...")
+        prompt = montar_prompt(dados_atuais, dados_anteriores)
+        analise = chamar_claude_api(prompt)
+
+    print("Gerando PDF...")
+    gerar_pdf(dados_atuais, analise, OUTPUT_PDF)
+
+    if args.email:
+        print("Enviando relatório por email...")
+        enviar_email(OUTPUT_PDF, analise)
+
+    salvar_snapshot(dados_atuais)
+    print(f"Concluído! Relatório salvo em: {OUTPUT_PDF}")
+
+
+if __name__ == "__main__":
+    main()

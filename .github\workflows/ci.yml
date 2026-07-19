@@ -1,0 +1,45 @@
+name: CI
+
+# Roda os 5 projetos em modo --demo a cada push/PR, como smoke test.
+# Não substitui teste unitário de verdade, mas garante que nenhum projeto
+# quebrou de forma óbvia (erro de sintaxe, import faltando, exceção não
+# tratada) antes de chegar na branch principal.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  demo-smoke-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: claude_ti_pipeline --demo
+        run: python claude_ti_pipeline/claude_ti_pipeline.py --demo
+
+      - name: config_drift_detector --demo
+        run: python config_drift_detector/config_drift_detector.py --demo
+
+      - name: password_spray_detector --demo
+        run: python password_spray_detector/password_spray_detector.py --demo
+
+      - name: file_integrity_monitor --demo (criar baseline)
+        run: python file_integrity_monitor/file_integrity_monitor.py --demo --criar-baseline
+
+      - name: file_integrity_monitor --demo (detectar mudanças)
+        run: python file_integrity_monitor/file_integrity_monitor.py --demo
+
+      - name: mini_soc_dashboard --demo
+        run: python mini_soc_dashboard/mini_soc_dashboard.py --demo

@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Artefatos gerados em tempo de execução (não versionar dados de ambiente real)
+baseline.json
+baseline_arquivos.json
+ultimo_snapshot.json
+pasta_monitorada_demo/
+relatorio_*.json
+relatorio_ti.pdf
+mini_soc_dashboard.html
+
+# Credenciais / segredos — NUNCA versionar
+.env
+*.pem
+*.key
+
+# Sistema operacional / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

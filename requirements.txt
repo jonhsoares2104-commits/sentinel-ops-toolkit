@@ -1,0 +1,10 @@
+# Dependências externas do repositório.
+#
+# Apenas o claude_ti_pipeline precisa de pacotes de terceiros — todos os
+# outros projetos (config_drift_detector, password_spray_detector,
+# file_integrity_monitor, mini_soc_dashboard) usam só biblioteca padrão
+# do Python (json, hashlib, smtplib, subprocess, etc.), de propósito,
+# para minimizar dependências em ambientes de servidor variados.
+
+reportlab>=4.0
+requests>=2.31

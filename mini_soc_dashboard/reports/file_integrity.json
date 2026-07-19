@@ -1,0 +1,25 @@
+{
+  "fonte": "file_integrity",
+  "gerado_em": "2026-07-16T20:45:43",
+  "total_achados": 3,
+  "achados": [
+    {
+      "categoria": "arquivo_alterado",
+      "item": "C:\\Windows\\System32\\drivers\\etc\\hosts",
+      "severidade": "CRITICO",
+      "detalhe": "Hash mudou. Entrada suspeita adicionada redirecionando login.microsoft.com."
+    },
+    {
+      "categoria": "arquivo_removido",
+      "item": "C:\\Scripts\\startup_script.ps1",
+      "severidade": "CRITICO",
+      "detalhe": "Arquivo presente no baseline não foi encontrado."
+    },
+    {
+      "categoria": "arquivo_novo",
+      "item": "C:\\Scripts\\svchost_updater.ps1",
+      "severidade": "ATENCAO",
+      "detalhe": "Arquivo não presente no baseline, apareceu na pasta monitorada."
+    }
+  ]
+}

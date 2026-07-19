@@ -1,0 +1,25 @@
+{
+  "fonte": "config_drift",
+  "gerado_em": "2026-07-16T20:45:43",
+  "total_achados": 3,
+  "achados": [
+    {
+      "categoria": "servico",
+      "item": "wuauserv",
+      "severidade": "CRITICO",
+      "detalhe": "Status: Running -> Stopped | StartType: Automatic -> Disabled"
+    },
+    {
+      "categoria": "registro",
+      "item": "EnableLUA",
+      "severidade": "CRITICO",
+      "detalhe": "Valor: 1 -> 0 (UAC desabilitado)"
+    },
+    {
+      "categoria": "firewall",
+      "item": "Regra Temporaria Suporte",
+      "severidade": "ATENCAO",
+      "detalhe": "Nova regra de firewall ativa, não presente no baseline."
+    }
+  ]
+}
